@@ -234,27 +234,49 @@ Resources:
           - SNSAction: 
               Encoding: UTF-8
               TopicArn: !Ref SimpleEmailParserSnsTopic
-  # Use ForEach to create a rule with a separate S3 prefix for each recipient address
-  Fn::ForEach::Recipient:
-    - RECIPIENT
-    - !Ref Recipients
-    - RecipientRule&{RECIPIENT}:
-        Type: AWS::SES::ReceiptRule
-        DependsOn: EmailBucketPolicy
-        Properties:
-          RuleSetName: !Ref SesReceiptRuleSet
-          After: !Ref ReceiptRuleDefault
-          Rule:
-            Enabled: true
-            ScanEnabled: true
-            TlsPolicy: Require
-            Recipients: !Ref RECIPIENT
-            Actions:
-              - S3Action:
-                  BucketName: !Ref EmailBucketName
-                  ObjectKeyPrefix: !Ref RECIPIENT 
-              - LambdaAction:
-                  FunctionArn: !GetAtt EmailForwarderLambda.Arn
+  # ForEach would be great to create a rule with a separate S3 prefix for each recipient address
+  # but it's currently not supported with serverless
+  # https://github.com/aws/aws-sam-cli/issues/5647
+  # Fn::ForEach::Recipient:
+  #   - RECIPIENT
+  #   - !Ref Recipients
+  #   - RecipientRule&{RECIPIENT}:
+  #       Type: AWS::SES::ReceiptRule
+  #       DependsOn: EmailBucketPolicy
+  #       Properties:
+  #         RuleSetName: !Ref SesReceiptRuleSet
+  #         After: !Ref ReceiptRuleDefault
+  #         Rule:
+  #           Enabled: true
+  #           ScanEnabled: true
+  #           TlsPolicy: Require
+  #           Recipients: !Ref RECIPIENT
+  #           Actions:
+  #             - S3Action:
+  #                 BucketName: !Ref EmailBucketName
+  #                 ObjectKeyPrefix: !Ref RECIPIENT 
+  #             - LambdaAction:
+  #                 FunctionArn: !GetAtt EmailForwarderLambda.Arn
+  # Build a custom resource as an alternative
+  # Brute force it in the meantime
+  ReceiptRule0:
+    Type: AWS::SES::ReceiptRule
+    DependsOn: EmailBucketPolicy
+    Properties:
+      RuleSetName: !Ref SesReceiptRuleSet
+      After: !Ref ReceiptRuleDefault
+      Rule:
+        Enabled: true
+        ScanEnabled: true
+        TlsPolicy: Require
+        Recipients:
+          - !Select [0, !Ref Recipients] 
+        Actions:
+          - S3Action:
+              BucketName: !Ref EmailBucketName
+              ObjectKeyPrefix: !Select [0, !Ref Recipients] 
+          - LambdaAction:
+              FunctionArn: !GetAtt EmailForwarderLambda.Arn
 
   # Optional receipt filters
   ReceiptFilterBlock:
