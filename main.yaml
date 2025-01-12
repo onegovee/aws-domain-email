@@ -1,0 +1,280 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: 
+  - AWS::LanguageExtensions
+  - AWS::Serverless-2016-10-31
+
+Parameters:
+  ZoneName:
+    Type: String
+  ZoneId:
+    Type: String
+  EmailBucketName:
+    Type: String
+  ForwardToAddress:
+    Type: String
+  Recipients:
+    Type: CommaDelimitedList
+  RecipientFilters:
+    Type: String
+    Default: false
+    AllowedValues:
+      - true
+      - false
+
+Conditions:
+  RecipientFilterCond: !Equals [ !Ref RecipientFilters, true ]
+
+Resources:
+  # For lambda backed custom resources to perform DKIM verification for the domain and set the active SES rule set
+  CustomLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-custom-cfn-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AssumeLambdaExecutionRole
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: SESDomainIdentityPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Sid: AllowSESDomainIdentityActions
+            Effect: Allow
+            Action:
+            - ses:ListIdentities
+            - ses:VerifyDomainDkim
+            - ses:VerifyDomainIdentity
+            - ses:SetActiveReceiptRuleSet
+            - ses:DeleteIdentity
+            Resource: "*"
+  CustomBackedLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-custom-cfn-function
+      CodeUri: lambda_custom
+      Description: Lambda function for lambda-backed cfn custom resource
+      Runtime: python3.9
+      Role: !GetAtt CustomLambdaExecutionRole.Arn
+      Handler: custom.lambda_handler
+      Timeout: 90
+
+  SesDomainIdentityMail:
+    Type: Custom::InvokeCustomLambda
+    Properties:
+      ServiceToken: !GetAtt CustomBackedLambda.Arn
+      ZoneName: !Ref ZoneName
+
+  # The responseData returned from the custom resource is not persisted between change sets so
+  # Do not modify the RecordSetGroup if the corresponding SES identity has been verified and is in use
+  SesDkimRecords:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      Comment: DNS records to complete SES domain identity verification
+      HostedZoneId: !Ref ZoneId
+      RecordSets: !GetAtt SesDomainIdentityMail.records
+  SesMxRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Comment: DNS record for SES to manage incoming email
+      HostedZoneId: !Ref ZoneId
+      Name: !Ref ZoneName
+      TTL: 60
+      Type: MX
+      ResourceRecords:
+      - !Sub "10 inbound-smtp.${AWS::Region}.amazonaws.com"
+  
+  # Create a rule set and set it as active
+  SesReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+  # Active rules sets can not be deleted  
+  SesActiveRulesSetDefault:
+    Type: Custom::SetActiveRuleSet
+    Properties:
+      ServiceToken: !GetAtt CustomBackedLambda.Arn
+      RuleSetName: !Ref SesReceiptRuleSet
+
+  # Lambda for simple email parsing via SNS
+  SimpleEmailParserLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-parser-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: AssumeLambdaExecutionRole
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+  SimpleEmailParserLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-parser-function
+      CodeUri: lambda_parser
+      Description: Lambda function for processing emails
+      Runtime: python3.12
+      Role: !GetAtt SimpleEmailParserLambdaExecutionRole.Arn
+      Handler: parser.lambda_handler
+      Timeout: 90
+  SimpleEmailParserSnsLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SimpleEmailParserLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      # construct the arn to avoid a circular dependency
+      SourceArn: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:*
+  SimpleEmailParserSnsTopic:
+    Type: AWS::SNS::Topic
+    DependsOn: SimpleEmailParserSnsLambdaInvokePermission
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-invoke-simple-parser"
+      Subscription:
+        - Protocol: lambda
+          Endpoint: !GetAtt SimpleEmailParserLambda.Arn
+  
+  # Set bucket policy where email is stored
+  EmailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EmailBucketName
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+            Principal:
+              Service: ses.amazonaws.com
+            Resource:
+              - !Sub arn:aws:s3:::${EmailBucketName}/*
+            Condition:
+              StringEquals:
+                'aws:Referer':
+                  - !Ref AWS::AccountId
+  
+  # Lambda for forwarding email
+  EmailForwarderLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-forwarder-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AssumeLambdaExecutionRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - s3:ListBucket
+                Effect: Allow
+                Resource: '*'
+              - Action:
+                  - s3:GetObject
+                Effect: Allow
+                Resource: !Sub arn:aws:s3:::${EmailBucketName}/*
+              - Action:
+                  - ses:SendRawEmail
+                Effect: Allow
+                Resource: '*'
+  EmailForwarderLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-forwarder-function
+      CodeUri: lambda_forwarder
+      Description: Lambda function for forwarding emails
+      Runtime: python3.12
+      Role: !GetAtt EmailForwarderLambdaExecutionRole.Arn
+      Handler: forwarder.lambda_handler
+      Timeout: 90
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref EmailBucketName
+          FORWARD_TO_ADDRESS: !Ref ForwardToAddress
+          DOMAIN: !Ref ZoneName
+  EmailForwarderSesLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EmailForwarderLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: ses.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      # construct the arn to avoid a circular dependency
+      SourceArn: !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/${SesReceiptRuleSet}:receipt-rule/*
+
+  # Send all email to parser
+  ReceiptRuleDefault:
+    Type: AWS::SES::ReceiptRule
+    Properties:
+      RuleSetName: !Ref SesReceiptRuleSet
+      Rule:
+        Enabled: true
+        ScanEnabled: true
+        TlsPolicy: Require
+        Recipients: !Ref Recipients
+        Actions:
+          - SNSAction: 
+              Encoding: UTF-8
+              TopicArn: !Ref SimpleEmailParserSnsTopic
+  # Use ForEach to create a rule with a separate S3 prefix for each recipient address
+  Fn::ForEach::Recipient:
+    - RECIPIENT
+    - !Ref Recipients
+    - RecipientRule&{RECIPIENT}:
+        Type: AWS::SES::ReceiptRule
+        DependsOn: EmailBucketPolicy
+        Properties:
+          RuleSetName: !Ref SesReceiptRuleSet
+          After: !Ref ReceiptRuleDefault
+          Rule:
+            Enabled: true
+            ScanEnabled: true
+            TlsPolicy: Require
+            Recipients: !Ref RECIPIENT
+            Actions:
+              - S3Action:
+                  BucketName: !Ref EmailBucketName
+                  ObjectKeyPrefix: !Ref RECIPIENT 
+              - LambdaAction:
+                  FunctionArn: !GetAtt EmailForwarderLambda.Arn
+
+  # Optional receipt filters
+  ReceiptFilterBlock:
+    Type: AWS::SES::ReceiptFilter
+    Condition: RecipientFilterCond
+    Properties:
+      Filter:
+        IpFilter:
+          Policy: Block
+          Cidr: 0.0.0.0/0
+  ReceiptFilterAllow:
+    Type: AWS::SES::ReceiptFilter
+    Condition: RecipientFilterCond
+    Properties:
+      Filter:
+        IpFilter:
+          Policy: Allow
+          Cidr: 209.85.0.0/16
+
+Outputs:
+  CustomLambdaOutput: 
+    Description: Message from the SES domain verification custom resource
+    Value: !GetAtt SesDomainIdentityMail.message
