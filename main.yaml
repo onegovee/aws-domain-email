@@ -25,6 +25,12 @@ Conditions:
   RecipientFilterCond: !Equals [ !Ref RecipientFilters, true ]
 
 Resources:
+  SnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+      DisplayName: !Sub "${AWS::StackName} alert"
+
   # For lambda backed custom resources to perform DKIM verification for the domain and set the active SES rule set
   CustomLambdaExecutionRole:
     Type: AWS::IAM::Role
@@ -219,6 +225,22 @@ Resources:
       SourceAccount: !Ref AWS::AccountId
       # construct the arn to avoid a circular dependency
       SourceArn: !Sub arn:aws:ses:${AWS::Region}:${AWS::AccountId}:receipt-rule-set/${SesReceiptRuleSet}:receipt-rule/*
+  EmailForwarderErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: EmailForwarderErrorAlarm
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300 
+      EvaluationPeriods: 1
+      Threshold: 1 
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EmailForwarderLambda
+      AlarmActions:
+        - !Ref SnsTopic
 
   # Send all email to parser
   ReceiptRuleDefault:
