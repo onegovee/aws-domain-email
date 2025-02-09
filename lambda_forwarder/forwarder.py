@@ -55,9 +55,12 @@ def lambda_handler(event, context):
     mail.add_header('Reply-To', original_sender)
   
   # To prevent "Duplicate header 'DKIM-Signature'" error
+  dkim_header_found = False
   for header in list(mail.keys()):
-    if header == "DKIM-Signature" and "amazonses.com" in mail[header]:
-      del mail[header]
+    if header.lower() == "dkim-signature":
+      if dkim_header_found:
+        del mail[header]
+      dkim_header_found = True
 
   # Forward the email using SES, keeping its original content
   try:
