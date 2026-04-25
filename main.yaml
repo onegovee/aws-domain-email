@@ -66,7 +66,7 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-custom-cfn-function
       CodeUri: lambda_custom
       Description: Lambda function for lambda-backed cfn custom resource
-      Runtime: python3.9
+      Runtime: python3.14
       Role: !GetAtt CustomLambdaExecutionRole.Arn
       Handler: custom.lambda_handler
       Timeout: 90
@@ -127,7 +127,7 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-parser-function
       CodeUri: lambda_parser
       Description: Lambda function for processing emails
-      Runtime: python3.12
+      Runtime: python3.14
       Role: !GetAtt SimpleEmailParserLambdaExecutionRole.Arn
       Handler: parser.lambda_handler
       Timeout: 90
@@ -207,7 +207,7 @@ Resources:
       FunctionName: !Sub ${AWS::StackName}-forwarder-function
       CodeUri: lambda_forwarder
       Description: Lambda function for forwarding emails
-      Runtime: python3.12
+      Runtime: python3.14
       Role: !GetAtt EmailForwarderLambdaExecutionRole.Arn
       Handler: forwarder.lambda_handler
       Timeout: 90
